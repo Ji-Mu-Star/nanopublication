@@ -1,47 +1,61 @@
-# 可复用题集（练习用，非正式案例、非预制答案）
+# 可复用合成题集与验收点
 
-本文件是 3 组练习段落，供标注人员/Agent 练习第 4、5 节规则。每题只给"拆解提示"（预期拆法要点），不写逐条标准答案——目的是训练，不是提供正式测试答案。两组来自真实论文摘要（可逐字溯源），一组为合成的边界情形题。
+以下五题用于开发训练与对照测试，均为**合成场景**，不是平台固定案例或预制答案。每题应保留输入、工具输出、最终结果和验收记录；没有实际运行时不得写成“已通过”。
 
----
+## 1. 通栏 + 双栏混合阅读顺序
 
-## 练习 1：真实论文摘要（化学/生物医学，6 句）
+**输入构造**：首页依次有通栏标题、通栏摘要、左栏 `LEFT_ONE/LEFT_TWO`、右栏 `RIGHT_ONE/RIGHT_TWO`；两页顶部重复 `SYNTHETIC HEADER`。
 
-> Alimohammadi, Mostafavi, Mahdavi, ChemistrySelect, 2020, DOI 10.1002/slct.201903179（摘要）：
->
-> According to the structure-activity relationships (SAR), we synthesized a series of novel thiourea derivatives based on the dapsone-naphthoquinone hybrid by the nucleophilic addition reaction of various primary/secondary amines to 2-[4-(4-isothiocyanato-benzenesulfonyl)-phenylamino]-[1,4]naphthoquinone (4). All thiourea derivatives (5 a-j) were screened for in vitro anticancer activity against human leukemia cell line (K562). Thiourea derivative containing N-methyl piperazine (5 h) was identified as the most effective molecule with IC50= 5.8±0.55 μM. Antimicrobial activity of thiourea derivatives (5 a–j) was evaluated in vitro against six strains of bacteria (Staphylococcus aureus, Staphylococcus epidermidis, Bacillus subtilis, Escherichia coli, Salmonella enterica and Klebsiella pneumoniae) and a fungus Candida kefyr by the microdilution method. Interestingly, compound 5 h exhibited better antibacterial activity compared with the dapsone as a positive control against S. epidermidis. The molecular docking studies indicated that compound 5 h may act as anticancer agent through the inhibition of Abl kinase and T315I Abl mutant.
+**验收点**：
 
-**拆解提示**：
-- 6 句应拆出约 9 条断言（方法 3、结果 3、推断 3），而不是 6 条或 1 条。
-- 第 3 句的"最有效"与"IC50=5.8±0.55 μM"是两个命题，应拆开（多数值拆）。
-- 第 6 句是并列机制 `Abl kinase and T315I Abl mutant`，按第 4.2 节"并列逐条拆"；且含 "may act"，`certainty=uncertain`、`assertion_type=conclusion_inference`。
-- 易错点：把第 4 句的 7 种菌/真菌逐条拆成 7 条（应作为一次评价的列举范围，合 1 条）。
+- 阅读顺序严格为标题 → 摘要 → 左栏两块 → 右栏两块。
+- 页眉只进入候选/确认的 `headers_footers`，不混入正文。
+- 每段可回指真实 `block_id` 和坐标。
+- 可复现 fixture：`tests/make_synthetic_pdf.py`；对应集成断言在 `tests/test_tools.py`。
 
----
+## 2. 多层表头、合并单元格与跨页续表
 
-## 练习 2：真实论文摘要（有机化学，2 句）
+**输入构造**：两层表头，一个 `rowspan=2`、一个 `colspan=2`，另有一个真实空白格；表格跨两页且第二页重复表头。
 
-> Liu, Hu, Xu, Lu, Yu, Lin, Chemistry of Natural Compounds, 2015, DOI 10.1007/s10600-015-1266-z（摘要）：
->
-> A facile and efficient one-step synthesis of a novel phenanthroindolizine skeleton was developed via the Vilsmeier–Haack reaction of accessible 18-acetamino-7-oxo-dehydroabietane. The structure and stereochemistry were confirmed by NMR, HR-MS, elemental analysis, and X-ray crystal structure analysis (XSA), and the proposed reaction pathway for the Vilsmeier-Haack reaction includes an unusual conjugate addition of enol to chloromethyleneiminium salt and intramolecular cyclization reaction.
+**验收点**：
 
-**拆解提示**：
-- 第 1 句是方法描述（`method_description`），1 条。
-- 第 2 句由"并且/以及"串联两个命题：结构确认（`experiment_result`，confirmed）与反应途径推断（`conclusion_inference`，uncertain）——按连接词切开。
-- 结构确认的四种方法（NMR、HR-MS、元素分析、XSA）是并列证据手段，不必再拆成四条。
+- 锚单元格无重叠、展开网格无未解释空洞，空白格有显式记录。
+- Markdown 与 `cells[]` 展开后逐格相等。
+- 续表使用同一 ID、多个 `locations`，`note=continuation`；重复表头处理有记录。
+- 人为改错一个 Markdown 数值时，校验器必须报错。
 
----
+## 3. 章节层级与参考文献交叉引用
 
-## 练习 3：合成的边界情形题（含图引用、未报告、转折）
+**输入构造**：`1.`、`1.1`、`1.1.1` 三级标题，文末参考文献双栏排列且序号不随物理文本流递增。
 
-> 某论文结果节（示意，非真实原文）：
->
-> 与对照组相比，化合物 B 处理 48 h 后肿瘤体积缩小 36%（p < 0.01），但体重无明显变化。如图 3 所示，肿瘤生长曲线随时间下降。该组的中位生存期未在文中报告。
+**验收点**：
 
-**拆解提示**：
-- 第 1 句含转折"但"：肿瘤体积缩小（`experiment_result`，confirmed）与体重无变化（`experiment_result`，confirmed，注意"无显著差异"谓词）拆两条。
-- 图 3 证据：只取正文文字陈述，标 `figure_evidence`、`figure_table_id="Fig. 3"`，不读曲线数据。
-- "中位生存期未报告"：不断言数值，记 `unreported_data`，不写估算。
+- 标题层级有编号、字号等依据；无法判断时保持扁平。
+- `section_id`、`paragraph_ids` 双向引用有效，无孤立或重复归属。
+- 参考文献按原引用序号组织，每条有真实定位。
+- 人为引用不存在的 `P999` 时，校验器必须报错。
 
----
+## 4. 公式与特殊字符保真
 
-> 以上题集用于复用与训练；正式评测以平台固定 3 个案例的实际材料为准，逐字复核。
+**输入构造**：正文含 `CO₂`、`α`、`−`、`±`；独立公式含上下标、希腊字母和编号，其中一个符号模糊。
+
+**验收点**：
+
+- `raw` 不静默替换形近字符；`latex` 与页图逐项一致。
+- 模糊公式的 `latex=null` 或有依据的转写，不使用伪造占位符；不确定项关联公式 ID。
+- 正文特殊字符不因全局 ASCII 规范化而失真。
+
+## 5. 扫描页、OCR 与部分完成
+
+**输入构造**：两页文字层正常、一页纯扫描表格、一页模糊正文；其中一个 `0/O` 容易混淆。
+
+**验收点**：
+
+- 文字层为空的页仍经过页图检查和 OCR，不能记作“空白页已成功提取”。
+- OCR 原文与任何纠正前后对照齐全；数值、变量和化学式不凭上下文猜测。
+- `coverage` 明确已完成/失败页；存在未解决高影响内容时不能标 `success`。
+- 布局证据外的模板正文经 `--layout` 校验必须报错。
+
+## 建议对照记录
+
+同一输入在“无 Skill/有 Skill”下使用相同模型、预算和工具，分别记录：页覆盖率、正文可回溯率、阅读顺序错误数、表格单元格正确数、公式符号错误数、校验违规数、耗时。只有实际运行的数值才能进入测试报告。

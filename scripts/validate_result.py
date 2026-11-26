@@ -1,239 +1,481 @@
 #!/usr/bin/env python3
-"""Lightweight structural validator for the Nanopublication result.json.
+"""Validate pdf-parse results against the case contract and internal evidence.
 
-Only the standard library (json) is used, so it runs anywhere Python 3 is
-present. It is a *key-field manual check*, not a full jsonschema validation:
-it checks required top-level keys, controlled-vocabulary enum values, ID
-patterns, and the internal cross-consistency that the SKILL.md section 9
-checklist requires. It never invents a value and never modifies the file.
+Standard library only. The case output_contract always takes precedence over the
+fallback schema. The validator never changes the result and never invents data.
 
 Usage:
-    python3 validate_result.py /app/output/result.json [output_schema.json]
+    python3 validate_result.py /app/output/result.json --case /input/case.json \
+        --layout /app/work/layout.json
 
-Exit code:
-    0  -> no violations found
-    1  -> violations found (printed to stdout, one per line as JSON objects)
+Exit codes: 0 = no violations, 1 = violations or unreadable input, 2 = usage error.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
+from pathlib import Path
+from typing import Any
 
-TASK_STATUS = {"success", "partial", "failed"}
-ASSERTION_TYPE = {"fact_statement", "experiment_result", "conclusion_inference", "method_description"}
-CERTAINTY = {"confirmed", "conditional", "uncertain"}
-EVIDENCE_TYPE = {"text_evidence", "figure_evidence", "table_evidence"}
-SUPPORT_RELATION = {"direct_support", "partial_support", "indirect_inference"}
-IMPACT_LEVEL = {"high", "medium", "low"}
-LOG_STATUS = {"completed", "partial", "failed"}
-DOCUMENT_TYPE = {"journal_article", "conference_paper", "preprint", "thesis", "book_chapter", "other"}
-SOURCE_SECTION = {"abstract", "introduction", "methods", "results", "discussion", "conclusion", "other"}
-QUALITY = {"excellent", "good", "fair", "poor"}
-ISSUE_TYPES = {
-    "granularity_too_coarse", "granularity_too_fine", "faithfulness_violation",
-    "evidence_mismatch", "evidence_insufficient", "relation_type_wrong",
-    "direction_reversed", "subject_confusion", "location_missing",
-    "metadata_missing", "format_invalid", "duplicate_assertion",
+ID_COLLECTIONS = {
+    "paragraphs": "paragraph_id", "sections": "section_id", "tables": "table_id",
+    "figures": "figure_id", "formulas": "formula_id", "references": "ref_id",
+    "footnotes": "footnote_id", "uncertain_items": "item_id",
 }
-TOP_REQUIRED = [
-    "case_id", "task_status", "status_reason", "answer", "source_metadata",
-    "assertions", "quality_check", "uncertainty_items", "processing_log",
-    "skill_version",
-]
-ASSERTION_REQUIRED = [
-    "assertion_id", "assertion_text", "assertion_type", "certainty", "scope",
-    "confidence_score", "confidence_rationale", "evidence", "notes",
-]
-EVIDENCE_REQUIRED = ["evidence_id", "evidence_text", "evidence_type", "support_relation", "location"]
-LOCATION_REQUIRED = ["page", "paragraph_index", "sentence_index"]
-UNCERTAINTY_REQUIRED = ["item_id", "item_type", "related_assertion_id", "description", "impact_level", "suggestion"]
-LOG_REQUIRED = ["step", "status", "detail"]
-
-ID_RE = re.compile(r"^A[0-9]{3}$")
-EVID_ID_RE = re.compile(r"^A[0-9]{3}-E[0-9]+$")
-UNC_ID_RE = re.compile(r"^U[0-9]{3}$")
-ISSUE_ID_RE = re.compile(r"^Q[0-9]{3}$")
 
 
-def violations_for(data: object) -> list[dict]:
-    v: list[dict] = []
-    if not isinstance(data, dict):
-        return [{"path": "$", "issue": "root must be a JSON object"}]
+def find_key(obj: Any, wanted: str) -> Any:
+    if isinstance(obj, dict):
+        if wanted in obj:
+            return obj[wanted]
+        for value in obj.values():
+            found = find_key(value, wanted)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_key(value, wanted)
+            if found is not None:
+                return found
+    return None
 
+
+def is_type(value: Any, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "null":
+        return value is None
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
+
+
+def resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    ref = schema.get("$ref")
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return schema
+    target: Any = root
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or part not in target:
+            return {}
+        target = target[part]
+    return target if isinstance(target, dict) else {}
+
+
+def validate_schema(value: Any, schema: Any, root: dict[str, Any], path: str, errors: list[dict[str, str]]) -> None:
+    if not isinstance(schema, dict):
+        return
+    schema = resolve_ref(schema, root)
+    if not schema:
+        return
+
+    expected = schema.get("type")
+    if expected is not None:
+        choices = expected if isinstance(expected, list) else [expected]
+        if not any(is_type(value, choice) for choice in choices):
+            errors.append({"path": path, "issue": f"expected type {choices}, got {type(value).__name__}"})
+            return
+    if "const" in schema and value != schema["const"]:
+        errors.append({"path": path, "issue": f"expected constant {schema['const']!r}"})
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append({"path": path, "issue": f"value {value!r} not in {schema['enum']}"})
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errors.append({"path": path, "issue": f"string shorter than {schema['minLength']}"})
+        if "pattern" in schema and not re.search(schema["pattern"], value):
+            errors.append({"path": path, "issue": f"string does not match {schema['pattern']}"})
+    if is_type(value, "number"):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append({"path": path, "issue": f"value below minimum {schema['minimum']}"})
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append({"path": path, "issue": f"value above maximum {schema['maximum']}"})
+
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                errors.append({"path": path, "issue": f"missing required key: {key}"})
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for key, child in properties.items():
+                if key in value:
+                    validate_schema(value[key], child, root, f"{path}.{key}", errors)
+        additional = schema.get("additionalProperties", True)
+        if additional is False and isinstance(properties, dict):
+            for key in value:
+                if key not in properties:
+                    errors.append({"path": f"{path}.{key}", "issue": "additional property is forbidden"})
+        elif isinstance(additional, dict) and isinstance(properties, dict):
+            for key in value:
+                if key not in properties:
+                    validate_schema(value[key], additional, root, f"{path}.{key}", errors)
+
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errors.append({"path": path, "issue": f"array has fewer than {schema['minItems']} items"})
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append({"path": path, "issue": f"array has more than {schema['maxItems']} items"})
+        if schema.get("uniqueItems"):
+            serialized = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in value]
+            if len(serialized) != len(set(serialized)):
+                errors.append({"path": path, "issue": "array items are not unique"})
+        if "items" in schema:
+            for index, item in enumerate(value):
+                validate_schema(item, schema["items"], root, f"{path}[{index}]", errors)
+
+
+def normalize_contract(contract: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Return a JSON-Schema-like contract, or (None, warning) for unknown shapes."""
+    if isinstance(contract, dict) and isinstance(contract.get("schema"), dict):
+        contract = contract["schema"]
+    if isinstance(contract, dict) and ("properties" in contract or "required" in contract):
+        return contract, None
+    fields = contract if isinstance(contract, list) else contract.get("fields") if isinstance(contract, dict) else None
+    if isinstance(fields, list):
+        required, properties = [], {}
+        for field in fields:
+            if isinstance(field, str):
+                required.append(field)
+                properties[field] = {}
+            elif isinstance(field, dict) and isinstance(field.get("name"), str):
+                name = field["name"]
+                if field.get("required", True):
+                    required.append(name)
+                prop: dict[str, Any] = {}
+                if isinstance(field.get("type"), str):
+                    prop["type"] = field["type"]
+                if "enum" in field:
+                    prop["enum"] = field["enum"]
+                properties[name] = prop
+        return {"type": "object", "required": required, "properties": properties}, None
+    if contract is None:
+        return None, None
+    return None, "output_contract shape is not recognized; required fields could not be checked automatically"
+
+
+def split_markdown_row(line: str) -> list[str]:
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    cells, current, escaped = [], [], False
+    for char in text:
+        if escaped:
+            current.extend(["\\", char])
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current).strip())
+    return cells
+
+
+def canonical_cell(text: str) -> str:
+    text = text.replace("\\|", "|").replace("<br>", " ").replace("<br/>", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def check_table(table: dict[str, Any], path: str, errors: list[dict[str, str]]) -> None:
+    cells = table.get("cells")
+    if not isinstance(cells, list) or not cells:
+        if table.get("markdown"):
+            errors.append({"path": f"{path}.cells", "issue": "nonempty Markdown table has no cell grid"})
+        return
+    valid_cells = [c for c in cells if isinstance(c, dict) and all(isinstance(c.get(k), int) and not isinstance(c.get(k), bool) for k in ("row", "col", "rowspan", "colspan"))]
+    if len(valid_cells) != len(cells) or not valid_cells:
+        return  # schema validation reports malformed cells
+    rows = max(c["row"] + c["rowspan"] - 1 for c in valid_cells)
+    cols = max(c["col"] + c["colspan"] - 1 for c in valid_cells)
+    grid: list[list[str | None]] = [[None for _ in range(cols)] for _ in range(rows)]
+    for index, cell in enumerate(valid_cells):
+        for row in range(cell["row"] - 1, cell["row"] + cell["rowspan"] - 1):
+            for col in range(cell["col"] - 1, cell["col"] + cell["colspan"] - 1):
+                if row >= rows or col >= cols:
+                    continue
+                if grid[row][col] is not None:
+                    errors.append({"path": f"{path}.cells[{index}]", "issue": f"overlapping cell at row {row + 1}, col {col + 1}"})
+                else:
+                    grid[row][col] = str(cell.get("text", ""))
+    for row_index, row in enumerate(grid):
+        for col_index, text in enumerate(row):
+            if text is None:
+                errors.append({"path": f"{path}.cells", "issue": f"grid hole at row {row_index + 1}, col {col_index + 1}; record an explicit empty cell"})
+
+    markdown = table.get("markdown")
+    if not isinstance(markdown, str) or not markdown.strip():
+        errors.append({"path": f"{path}.markdown", "issue": "structured cells exist but Markdown is empty"})
+        return
+    lines = [line for line in markdown.splitlines() if line.strip()]
+    if len(lines) < 2:
+        errors.append({"path": f"{path}.markdown", "issue": "Markdown table needs a header and separator"})
+        return
+    md_rows = [split_markdown_row(lines[0])] + [split_markdown_row(line) for line in lines[2:]]
+    separators = split_markdown_row(lines[1])
+    if not separators or not all(re.fullmatch(r":?-+:?", item.replace(" ", "")) for item in separators):
+        errors.append({"path": f"{path}.markdown", "issue": "second Markdown row is not a valid separator"})
+    if len(md_rows) != rows:
+        errors.append({"path": f"{path}.markdown", "issue": f"logical row count {len(md_rows)} != cell grid {rows}"})
+    for row_index, md_row in enumerate(md_rows):
+        if len(md_row) != cols:
+            errors.append({"path": f"{path}.markdown", "issue": f"row {row_index + 1} has {len(md_row)} columns, expected {cols}"})
+            continue
+        if row_index >= rows:
+            continue
+        for col_index, md_text in enumerate(md_row):
+            source_text = grid[row_index][col_index]
+            if source_text is not None and canonical_cell(md_text) != canonical_cell(source_text):
+                errors.append({"path": f"{path}.markdown", "issue": f"cell mismatch at row {row_index + 1}, col {col_index + 1}: {md_text!r} != {source_text!r}"})
+
+
+def canonical_source(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def layout_body(layout: dict[str, Any]) -> tuple[str, str]:
+    chunks = []
+    for page in layout.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        blocks = {b.get("block_id"): b for b in page.get("blocks", []) if isinstance(b, dict)}
+        for block_id in page.get("reading_order", []):
+            block = blocks.get(block_id)
+            if block and isinstance(block.get("text"), str):
+                chunks.append(block["text"])
+    joined = "\n".join(chunks)
+    # Variant for documented dehyphenation across a soft line break.
+    dehyphenated = re.sub(r"-\s*\n\s*", "", joined)
+    return canonical_source(joined), canonical_source(dehyphenated)
+
+
+def cross_checks(data: dict[str, Any], layout: dict[str, Any] | None, full_fallback: bool, errors: list[dict[str, str]], warnings: list[dict[str, str]]) -> None:
     def add(path: str, issue: str) -> None:
-        v.append({"path": path, "issue": issue})
+        errors.append({"path": path, "issue": issue})
 
-    for key in TOP_REQUIRED:
-        if key not in data:
-            add("$", f"missing required top-level key: {key}")
-
-    if data.get("task_status") not in TASK_STATUS:
-        add("$.task_status", f"value {data.get('task_status')!r} not in {sorted(TASK_STATUS)}")
-
-    # answer
-    answer = data.get("answer")
-    if isinstance(answer, dict):
-        for key in ("question", "direct_answer", "answer_assertion_ids"):
-            if key not in answer:
-                add("$.answer", f"missing required key: {key}")
-    else:
-        add("$.answer", "answer must be an object")
-
-    # assertions
-    assertions = data.get("assertions")
-    if not isinstance(assertions, list):
-        add("$.assertions", "assertions must be an array")
-    else:
-        seen_ids: set[str] = set()
-        for i, a in enumerate(assertions):
-            p = f"$.assertions[{i}]"
-            if not isinstance(a, dict):
-                add(p, "assertion must be an object")
+    identifiers: dict[str, set[str]] = {}
+    for collection, id_key in ID_COLLECTIONS.items():
+        values = data.get(collection)
+        if not isinstance(values, list):
+            continue
+        seen: set[str] = set()
+        for index, item in enumerate(values):
+            if not isinstance(item, dict):
                 continue
-            for key in ASSERTION_REQUIRED:
-                if key not in a:
-                    add(p, f"missing required key: {key}")
-            aid = a.get("assertion_id")
-            if not isinstance(aid, str) or not ID_RE.match(aid):
-                add(f"{p}.assertion_id", f"{aid!r} does not match ^A[0-9]{{3}}$")
-            elif aid in seen_ids:
-                add(f"{p}.assertion_id", f"duplicate assertion id {aid}")
-            seen_ids.add(str(aid))
-            if a.get("assertion_type") not in ASSERTION_TYPE:
-                add(f"{p}.assertion_type", f"{a.get('assertion_type')!r} not in controlled vocabulary")
-            if a.get("certainty") not in CERTAINTY:
-                add(f"{p}.certainty", f"{a.get('certainty')!r} not in controlled vocabulary")
-            cs = a.get("confidence_score")
-            if not isinstance(cs, (int, float)) or isinstance(cs, bool) or not (0.0 <= cs <= 1.0):
-                add(f"{p}.confidence_score", f"{cs!r} must be a number in [0,1]")
-            evidence = a.get("evidence")
-            if not isinstance(evidence, list):
-                add(f"{p}.evidence", "evidence must be an array")
+            identifier = item.get(id_key)
+            if isinstance(identifier, str):
+                if identifier in seen:
+                    add(f"$.{collection}[{index}].{id_key}", f"duplicate ID {identifier}")
+                seen.add(identifier)
+        identifiers[collection] = seen
+
+    paragraph_ids = identifiers.get("paragraphs", set())
+    section_ids = identifiers.get("sections", set())
+    memberships: dict[str, int] = {pid: 0 for pid in paragraph_ids}
+    for index, section in enumerate(data.get("sections", [])):
+        if not isinstance(section, dict):
+            continue
+        if isinstance(section.get("page_start"), int) and isinstance(section.get("page_end"), int) and section["page_start"] > section["page_end"]:
+            add(f"$.sections[{index}]", "page_start is after page_end")
+        for pid in section.get("paragraph_ids", []):
+            if pid not in paragraph_ids:
+                add(f"$.sections[{index}].paragraph_ids", f"unknown paragraph ID {pid!r}")
             else:
-                for j, e in enumerate(evidence):
-                    ep = f"{p}.evidence[{j}]"
-                    if not isinstance(e, dict):
-                        add(ep, "evidence item must be an object")
-                        continue
-                    for key in EVIDENCE_REQUIRED:
-                        if key not in e:
-                            add(ep, f"missing required key: {key}")
-                    eid = e.get("evidence_id")
-                    if not isinstance(eid, str) or not EVID_ID_RE.match(eid):
-                        add(f"{ep}.evidence_id", f"{eid!r} does not match ^A[0-9]{{3}}-E[0-9]+$")
-                    if e.get("evidence_type") not in EVIDENCE_TYPE:
-                        add(f"{ep}.evidence_type", f"{e.get('evidence_type')!r} not in controlled vocabulary")
-                    if e.get("support_relation") not in SUPPORT_RELATION:
-                        add(f"{ep}.support_relation", f"{e.get('support_relation')!r} not in controlled vocabulary")
-                    loc = e.get("location")
-                    if not isinstance(loc, dict):
-                        add(f"{ep}.location", "location must be an object")
-                    else:
-                        for key in LOCATION_REQUIRED:
-                            if key not in loc:
-                                add(f"{ep}.location", f"missing required key: {key}")
+                memberships[pid] += 1
+    for index, paragraph in enumerate(data.get("paragraphs", [])):
+        if not isinstance(paragraph, dict):
+            continue
+        pid = paragraph.get("paragraph_id")
+        sid = paragraph.get("section_id")
+        if sid is not None and sid not in section_ids:
+            add(f"$.paragraphs[{index}].section_id", f"unknown section ID {sid!r}")
+        if isinstance(pid, str) and sid is not None and memberships.get(pid, 0) == 0:
+            add(f"$.paragraphs[{index}]", "section_id is set but no section lists this paragraph")
+        if isinstance(pid, str) and memberships.get(pid, 0) > 1:
+            add(f"$.paragraphs[{index}]", "paragraph is listed in multiple sections")
 
-    # source_metadata
-    sm = data.get("source_metadata")
-    if isinstance(sm, dict):
-        for key in ("document_title", "document_id", "document_type", "authors",
-                    "publish_year", "publish_source", "version", "source_page_range",
-                    "source_section", "source_paragraph_range", "metadata_notes"):
-            if key not in sm:
-                add("$.source_metadata", f"missing required key: {key}")
-        if sm.get("document_type") not in DOCUMENT_TYPE:
-            add("$.source_metadata.document_type", f"{sm.get('document_type')!r} not in controlled vocabulary")
-        if sm.get("source_section") not in SOURCE_SECTION:
-            add("$.source_metadata.source_section", f"{sm.get('source_section')!r} not in controlled vocabulary")
-    else:
-        add("$.source_metadata", "source_metadata must be an object")
+    coverage = data.get("coverage")
+    total = None
+    if isinstance(coverage, dict):
+        total = coverage.get("pages_total")
+        attempted = set(coverage.get("pages_attempted", []))
+        completed = set(coverage.get("pages_completed", []))
+        failed = set(coverage.get("pages_failed", []))
+        if isinstance(total, int):
+            expected = set(range(1, total + 1))
+            for name, pages in (("attempted", attempted), ("completed", completed), ("failed", failed)):
+                if not pages <= expected:
+                    add(f"$.coverage.pages_{name}", "page number outside 1..pages_total")
+            if completed & failed:
+                add("$.coverage", "pages_completed and pages_failed overlap")
+            if completed | failed != attempted:
+                add("$.coverage", "completed + failed must partition attempted pages")
+            if data.get("task_status") == "success" and (completed != expected or failed or attempted != expected):
+                add("$.task_status", "success requires every page attempted and completed, with no failed page")
+        document = data.get("document")
+        if isinstance(document, dict) and isinstance(document.get("page_count"), int) and total != document["page_count"]:
+            add("$.coverage.pages_total", "does not equal document.page_count")
 
-    # quality_check
-    qc = data.get("quality_check")
-    if isinstance(qc, dict):
-        for key in ("overall_quality", "issue_count", "issues", "pass"):
-            if key not in qc:
-                add("$.quality_check", f"missing required key: {key}")
-        if qc.get("overall_quality") not in QUALITY:
-            add("$.quality_check.overall_quality", f"{qc.get('overall_quality')!r} not in controlled vocabulary")
-        issues = qc.get("issues")
-        if isinstance(issues, list) and isinstance(qc.get("issue_count"), (int, float)):
-            if int(qc["issue_count"]) != len(issues):
-                add("$.quality_check", f"issue_count ({qc['issue_count']}) != len(issues) ({len(issues)})")
+    for collection in ("paragraphs", "tables", "figures", "formulas", "references", "footnotes"):
+        items = data.get(collection)
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or not isinstance(item.get("locations"), list):
+                continue
+            for loc_index, location in enumerate(item["locations"]):
+                if not isinstance(location, dict):
+                    continue
+                page = location.get("pdf_page")
+                if isinstance(total, int) and isinstance(page, int) and not 1 <= page <= total:
+                    add(f"$.{collection}[{index}].locations[{loc_index}].pdf_page", "page outside coverage.pages_total")
+                bbox = location.get("bbox")
+                if isinstance(bbox, list) and len(bbox) == 4 and all(is_type(x, "number") for x in bbox):
+                    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+                        add(f"$.{collection}[{index}].locations[{loc_index}].bbox", "bbox must satisfy xMin < xMax and yMin < yMax")
+
+    tables = data.get("tables")
+    if isinstance(tables, list):
+        for index, table in enumerate(tables):
+            if isinstance(table, dict):
+                check_table(table, f"$.tables[{index}]", errors)
+
+    quality = data.get("quality_check")
+    if isinstance(quality, dict):
+        issues = quality.get("issues")
         if isinstance(issues, list):
-            for k, it in enumerate(issues):
-                if isinstance(it, dict) and it.get("issue_type") not in ISSUE_TYPES:
-                    add(f"$.quality_check.issues[{k}].issue_type", f"{it.get('issue_type')!r} not in controlled vocabulary")
+            if quality.get("issue_count") != len(issues):
+                add("$.quality_check.issue_count", "does not equal len(issues)")
+            if quality.get("pass") is True and issues:
+                add("$.quality_check.pass", "cannot be true when issues are present")
+            if quality.get("pass") is False and not issues:
+                add("$.quality_check.pass", "false requires at least one recorded issue")
+        if data.get("task_status") == "success" and quality.get("pass") is not True:
+            add("$.task_status", "success requires quality_check.pass=true")
 
-    # uncertainty_items
-    unc = data.get("uncertainty_items")
-    if isinstance(unc, list):
-        for i, u in enumerate(unc):
-            p = f"$.uncertainty_items[{i}]"
-            if not isinstance(u, dict):
-                add(p, "item must be an object")
+    uncertainties = data.get("uncertain_items")
+    if isinstance(uncertainties, list):
+        for index, item in enumerate(uncertainties):
+            if not isinstance(item, dict):
                 continue
-            for key in UNCERTAINTY_REQUIRED:
-                if key not in u:
-                    add(p, f"missing required key: {key}")
-            if isinstance(u.get("item_id"), str) and not UNC_ID_RE.match(u["item_id"]):
-                add(f"{p}.item_id", f"{u.get('item_id')!r} does not match ^U[0-9]{{3}}$")
-            if u.get("impact_level") not in IMPACT_LEVEL:
-                add(f"{p}.impact_level", f"{u.get('impact_level')!r} not in controlled vocabulary")
+            if data.get("task_status") == "success" and item.get("impact_level") == "high":
+                add(f"$.uncertain_items[{index}].impact_level", "success cannot retain a high-impact unresolved item")
+            if item.get("item_type") == "ocr_corrected":
+                if not item.get("raw_text") or not item.get("corrected_text"):
+                    add(f"$.uncertain_items[{index}]", "ocr_corrected requires raw_text and corrected_text")
+                elif item["raw_text"] == item["corrected_text"]:
+                    add(f"$.uncertain_items[{index}]", "ocr_corrected raw and corrected text are identical")
 
-    # processing_log
-    log = data.get("processing_log")
-    if isinstance(log, list):
-        for i, step in enumerate(log):
-            p = f"$.processing_log[{i}]"
-            if not isinstance(step, dict):
-                add(p, "step must be an object")
+    if full_fallback and data.get("task_status") == "success" and not data.get("paragraphs"):
+        add("$.paragraphs", "a successful full-document parse cannot have an empty paragraph array")
+
+    if layout is not None:
+        source_variants = layout_body(layout)
+        for index, paragraph in enumerate(data.get("paragraphs", [])):
+            if not isinstance(paragraph, dict) or paragraph.get("source_type") != "text_layer":
                 continue
-            for key in LOG_REQUIRED:
-                if key not in step:
-                    add(p, f"missing required key: {key}")
-            if step.get("status") not in LOG_STATUS:
-                add(f"{p}.status", f"{step.get('status')!r} not in controlled vocabulary")
-
-    # answer_assertion_ids must reference existing assertions
-    if isinstance(answer, dict) and isinstance(answer.get("answer_assertion_ids"), list):
-        valid_ids = set()
-        if isinstance(assertions, list):
-            for a in assertions:
-                if isinstance(a, dict) and isinstance(a.get("assertion_id"), str):
-                    valid_ids.add(a["assertion_id"])
-        for rid in answer["answer_assertion_ids"]:
-            if rid not in valid_ids:
-                add("$.answer.answer_assertion_ids", f"{rid!r} does not reference an existing assertion")
-
-    return v
+            text = paragraph.get("text")
+            if isinstance(text, str) and text.strip():
+                candidate = canonical_source(text)
+                if not any(candidate and candidate in source for source in source_variants):
+                    add(f"$.paragraphs[{index}].text", "text is not traceable to the supplied layout evidence (possible template, fabrication, or unsupported merge)")
+        sources = data.get("sources")
+        if isinstance(sources, list) and isinstance(layout.get("source_sha256"), str):
+            hashes = {s.get("sha256") for s in sources if isinstance(s, dict) and s.get("role") == "source_pdf"}
+            if hashes and layout["source_sha256"] not in hashes:
+                add("$.sources", "source PDF hash does not match the supplied layout evidence")
+        empty_pages = set((layout.get("coverage_hint") or {}).get("pages_without_body_text", []))
+        if isinstance(coverage, dict) and empty_pages:
+            completed = set(coverage.get("pages_completed", []))
+            if empty_pages & completed and not any(isinstance(u, dict) and u.get("item_type") in {"unreadable", "missing_section", "partial_coverage"} for u in uncertainties or []):
+                add("$.coverage.pages_completed", "layout reports textless pages but no OCR/unreadable/partial-coverage item explains their completion")
 
 
-def main(argv: list[str]) -> int:
-    if not argv:
-        print("usage: validate_result.py RESULT.json [SCHEMA.json]", file=sys.stderr)
-        return 2
-    result_path = argv[0]
+def validate(data: Any, case: dict[str, Any] | None, layout: dict[str, Any] | None, fallback_schema: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    if not isinstance(data, dict):
+        return [{"path": "$", "issue": "root must be a JSON object"}], warnings
+
+    contract = find_key(case, "output_contract") if case else None
+    contract_schema, contract_warning = normalize_contract(contract)
+    if contract_warning:
+        warnings.append({"path": "$.output_contract", "issue": contract_warning})
+
+    if contract_schema is not None:
+        validate_schema(data, contract_schema, contract_schema, "$", errors)
+        # Validate any recognized rich fields that the contract permits, without
+        # imposing the fallback schema's required keys.
+        for key, subschema in fallback_schema.get("properties", {}).items():
+            if key in data:
+                validate_schema(data[key], subschema, fallback_schema, f"$.{key}", errors)
+        full_fallback = False
+    elif contract is not None:
+        # An unrecognized but real contract still takes precedence: never force
+        # our fallback required fields onto it. Check only recognized rich fields.
+        for key, subschema in fallback_schema.get("properties", {}).items():
+            if key in data:
+                validate_schema(data[key], subschema, fallback_schema, f"$.{key}", errors)
+        full_fallback = False
+    else:
+        validate_schema(data, fallback_schema, fallback_schema, "$", errors)
+        full_fallback = True
+
+    if case:
+        expected_id = find_key(case, "case_id")
+        if expected_id is not None and data.get("case_id") != expected_id:
+            errors.append({"path": "$.case_id", "issue": f"must exactly equal case.json case_id {expected_id!r}"})
+    cross_checks(data, layout, full_fallback, errors, warnings)
+    return errors, warnings
+
+
+def load_json(path: Path) -> Any:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("result", type=Path)
+    parser.add_argument("--case", type=Path)
+    parser.add_argument("--layout", type=Path)
+    parser.add_argument("--schema", type=Path, default=Path(__file__).resolve().parent.parent / "references" / "result.schema.json")
+    args = parser.parse_args()
     try:
-        with open(result_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        print(f'{{"path": "{result_path}", "issue": "file not found"}}')
+        data = load_json(args.result)
+        case = load_json(args.case) if args.case else None
+        layout = load_json(args.layout) if args.layout else None
+        fallback_schema = load_json(args.schema)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(json.dumps({"path": "$", "issue": f"cannot read input: {exc}"}, ensure_ascii=False))
         return 1
-    except json.JSONDecodeError as exc:
-        print(f'{{"path": "{result_path}", "issue": "invalid JSON: {exc}"}}')
+    errors, warnings = validate(data, case, layout, fallback_schema)
+    for item in errors:
+        print(json.dumps({"severity": "error", **item}, ensure_ascii=False))
+    for item in warnings:
+        print(json.dumps({"severity": "warning", **item}, ensure_ascii=False))
+    if errors:
+        print(f"validation failed: {len(errors)} error(s), {len(warnings)} warning(s)", file=sys.stderr)
         return 1
-
-    violations = violations_for(data)
-    if violations:
-        for item in violations:
-            print(json.dumps(item, ensure_ascii=False))
-        print(f"validation failed: {len(violations)} violation(s)", file=sys.stderr)
-        return 1
-    print("validation passed: no violations found")
+    print(f"validation passed: 0 errors, {len(warnings)} warning(s)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

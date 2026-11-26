@@ -1,0 +1,262 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pdf-parse fallback result (use only when case.json has no output_contract)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id", "skill_version", "task_status", "status_reason", "sources",
+    "document", "sections", "paragraphs", "tables", "figures", "formulas",
+    "references", "footnotes", "headers_footers", "coverage", "uncertain_items",
+    "quality_check", "processing_log"
+  ],
+  "properties": {
+    "case_id": {"type": ["string", "number"]},
+    "skill_version": {"const": "pdf-parse@2.0.0"},
+    "task_status": {"enum": ["success", "partial", "failed"]},
+    "status_reason": {"type": "string", "minLength": 1},
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "role"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "role": {"enum": ["source_pdf", "task_input", "other"]}
+        }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "authors", "affiliations", "abstract", "keywords", "document_id", "page_count", "language"],
+      "properties": {
+        "title": {"$ref": "#/definitions/nullableString"},
+        "authors": {"type": "array", "items": {"type": "string"}},
+        "affiliations": {"type": "array", "items": {"type": "string"}},
+        "abstract": {"$ref": "#/definitions/nullableString"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "document_id": {"$ref": "#/definitions/nullableString"},
+        "page_count": {"type": "integer", "minimum": 1},
+        "language": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "sections": {"type": "array", "items": {"$ref": "#/definitions/section"}},
+    "paragraphs": {"type": "array", "items": {"$ref": "#/definitions/paragraph"}},
+    "tables": {"type": "array", "items": {"$ref": "#/definitions/table"}},
+    "figures": {"type": "array", "items": {"$ref": "#/definitions/figure"}},
+    "formulas": {"type": "array", "items": {"$ref": "#/definitions/formula"}},
+    "references": {"type": "array", "items": {"$ref": "#/definitions/reference"}},
+    "footnotes": {"type": "array", "items": {"$ref": "#/definitions/footnote"}},
+    "headers_footers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "text", "pages", "status"],
+        "properties": {
+          "type": {"enum": ["header", "footer", "margin_note"]},
+          "text": {"type": "string", "minLength": 1},
+          "pages": {"$ref": "#/definitions/pageArray"},
+          "status": {"enum": ["candidate", "confirmed"]}
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pages_total", "pages_attempted", "pages_completed", "pages_failed", "notes"],
+      "properties": {
+        "pages_total": {"type": "integer", "minimum": 1},
+        "pages_attempted": {"$ref": "#/definitions/pageArray"},
+        "pages_completed": {"$ref": "#/definitions/pageArray"},
+        "pages_failed": {"$ref": "#/definitions/pageArray"},
+        "notes": {"type": "string"}
+      }
+    },
+    "uncertain_items": {"type": "array", "items": {"$ref": "#/definitions/uncertainty"}},
+    "quality_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall_quality", "issue_count", "issues", "pass"],
+      "properties": {
+        "overall_quality": {"enum": ["excellent", "good", "fair", "poor"]},
+        "issue_count": {"type": "integer", "minimum": 0},
+        "issues": {"type": "array", "items": {"$ref": "#/definitions/issue"}},
+        "pass": {"type": "boolean"}
+      }
+    },
+    "processing_log": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "status", "detail"],
+        "properties": {
+          "step": {"type": "string", "minLength": 1},
+          "status": {"enum": ["completed", "partial", "failed", "skipped"]},
+          "detail": {"type": "string", "minLength": 1},
+          "artifact": {"type": "string"}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "nullableString": {"type": ["string", "null"]},
+    "pageArray": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "uniqueItems": true
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pdf_page", "column", "block", "bbox"],
+      "properties": {
+        "pdf_page": {"type": "integer", "minimum": 1},
+        "printed_page": {"type": ["string", "number", "null"]},
+        "column": {"type": "integer", "minimum": 0},
+        "block": {"type": "string", "minLength": 1},
+        "bbox": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 4,
+          "maxItems": 4
+        }
+      }
+    },
+    "locations": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/location"}},
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["section_id", "level", "numbering", "title", "page_start", "page_end", "paragraph_ids"],
+      "properties": {
+        "section_id": {"type": "string", "pattern": "^S[0-9]+$"},
+        "level": {"type": "integer", "minimum": 1, "maximum": 6},
+        "numbering": {"type": "string"},
+        "title": {"type": "string", "minLength": 1},
+        "page_start": {"type": "integer", "minimum": 1},
+        "page_end": {"type": "integer", "minimum": 1},
+        "paragraph_ids": {"type": "array", "items": {"type": "string", "pattern": "^P[0-9]{3,}$"}, "uniqueItems": true}
+      }
+    },
+    "paragraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paragraph_id", "text", "section_id", "source_type", "locations", "normalization", "notes"],
+      "properties": {
+        "paragraph_id": {"type": "string", "pattern": "^P[0-9]{3,}$"},
+        "text": {"type": "string", "minLength": 1},
+        "section_id": {"type": ["string", "null"], "pattern": "^S[0-9]+$"},
+        "source_type": {"enum": ["text_layer", "ocr"]},
+        "locations": {"$ref": "#/definitions/locations"},
+        "normalization": {"enum": ["none", "soft_linebreak_join", "dehyphenated", "cross_page_join", "ocr_raw"]},
+        "notes": {"type": "string"}
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["row", "col", "rowspan", "colspan", "text", "is_header"],
+      "properties": {
+        "row": {"type": "integer", "minimum": 1},
+        "col": {"type": "integer", "minimum": 1},
+        "rowspan": {"type": "integer", "minimum": 1},
+        "colspan": {"type": "integer", "minimum": 1},
+        "text": {"type": "string"},
+        "is_header": {"type": "boolean"}
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["table_id", "caption", "locations", "markdown", "cells", "note"],
+      "properties": {
+        "table_id": {"type": "string", "pattern": "^T[0-9]+$"},
+        "caption": {"$ref": "#/definitions/nullableString"},
+        "locations": {"$ref": "#/definitions/locations"},
+        "markdown": {"type": "string"},
+        "cells": {"type": "array", "items": {"$ref": "#/definitions/cell"}},
+        "note": {"type": "string"}
+      }
+    },
+    "figure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["figure_id", "caption", "locations", "kind", "note"],
+      "properties": {
+        "figure_id": {"type": "string", "pattern": "^F[0-9]+$"},
+        "caption": {"$ref": "#/definitions/nullableString"},
+        "locations": {"$ref": "#/definitions/locations"},
+        "kind": {"enum": ["figure", "chart", "diagram", "photo", "other"]},
+        "note": {"type": "string"}
+      }
+    },
+    "formula": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formula_id", "number", "latex", "raw", "locations", "note"],
+      "properties": {
+        "formula_id": {"type": "string", "pattern": "^EQ[0-9]+$"},
+        "number": {"type": "string"},
+        "latex": {"$ref": "#/definitions/nullableString"},
+        "raw": {"type": "string", "minLength": 1},
+        "locations": {"$ref": "#/definitions/locations"},
+        "note": {"type": "string"}
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref_id", "order", "text", "locations"],
+      "properties": {
+        "ref_id": {"type": "string", "pattern": "^R[0-9]+$"},
+        "order": {"type": "integer", "minimum": 1},
+        "text": {"type": "string", "minLength": 1},
+        "locations": {"$ref": "#/definitions/locations"}
+      }
+    },
+    "footnote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["footnote_id", "anchor", "text", "locations"],
+      "properties": {
+        "footnote_id": {"type": "string", "pattern": "^FN[0-9]+$"},
+        "anchor": {"type": "string"},
+        "text": {"type": "string", "minLength": 1},
+        "locations": {"$ref": "#/definitions/locations"}
+      }
+    },
+    "uncertainty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "related_id", "description", "impact_level", "suggestion"],
+      "properties": {
+        "item_id": {"type": "string", "pattern": "^U[0-9]{3,}$"},
+        "item_type": {"enum": ["unreadable", "not_reported", "ocr_uncertain", "ocr_corrected", "missing_section", "encrypted_pdf", "ambiguous_layout", "partial_coverage", "tool_unavailable", "source_conflict", "location_uncertain"]},
+        "related_id": {"type": ["string", "null"]},
+        "description": {"type": "string", "minLength": 1},
+        "impact_level": {"enum": ["high", "medium", "low"]},
+        "suggestion": {"type": "string", "minLength": 1},
+        "raw_text": {"type": "string"},
+        "corrected_text": {"type": "string"}
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issue_id", "issue_type", "target_id", "issue_description", "correction_suggestion", "detected_by"],
+      "properties": {
+        "issue_id": {"type": "string", "pattern": "^Q[0-9]{3,}$"},
+        "issue_type": {"enum": ["text_mismatch", "template_content", "reading_order_wrong", "column_mix", "header_footer_mixed", "table_cell_wrong", "formula_garbled", "section_wrong", "location_missing", "unreadable_not_marked", "coverage_incomplete", "contract_violation", "format_invalid"]},
+        "target_id": {"type": ["string", "null"]},
+        "issue_description": {"type": "string", "minLength": 1},
+        "correction_suggestion": {"type": "string", "minLength": 1},
+        "detected_by": {"enum": ["agent", "script", "visual_review"]}
+      }
+    }
+  }
+}
